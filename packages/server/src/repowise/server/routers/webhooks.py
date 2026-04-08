@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,10 +15,25 @@ from repowise.core.persistence import crud
 from repowise.server.deps import get_db_session
 from repowise.server.schemas import WebhookResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/webhooks", tags=["webhooks"])
 
 _GITHUB_SECRET = os.environ.get("REPOWISE_GITHUB_WEBHOOK_SECRET", "")
 _GITLAB_TOKEN = os.environ.get("REPOWISE_GITLAB_WEBHOOK_TOKEN", "")
+
+if not _GITHUB_SECRET:
+    logger.warning(
+        "webhook.github_secret_missing — REPOWISE_GITHUB_WEBHOOK_SECRET is not set; "
+        "GitHub webhook signature verification is DISABLED. "
+        "Any caller can trigger syncs via /api/webhooks/github."
+    )
+if not _GITLAB_TOKEN:
+    logger.warning(
+        "webhook.gitlab_token_missing — REPOWISE_GITLAB_WEBHOOK_TOKEN is not set; "
+        "GitLab webhook token verification is DISABLED. "
+        "Any caller can trigger syncs via /api/webhooks/gitlab."
+    )
 
 
 def _verify_github_signature(body: bytes, signature_header: str) -> None:

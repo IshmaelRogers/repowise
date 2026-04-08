@@ -137,6 +137,7 @@ def _save_global_embedder(embedder: str, api_key: str) -> None:
             yaml.dump(existing, default_flow_style=False, sort_keys=False),
             encoding="utf-8",
         )
+        os.chmod(config_path, 0o600)  # owner read/write only — contains API keys
     except Exception:
         pass  # Non-fatal — user just gets prompted again next time.
 
@@ -182,6 +183,22 @@ def _find_local_web() -> Path | None:
     return None
 
 
+def _safe_extract(tar: tarfile.TarFile, dest: Path) -> None:
+    """Extract *tar* into *dest*, refusing entries that would escape the destination.
+
+    Guards against path-traversal (zip-slip) attacks where a crafted archive
+    contains members with absolute paths or ``..`` components that resolve to a
+    location outside *dest*.
+    """
+    dest_resolved = dest.resolve()
+    for member in tar.getmembers():
+        member_path = (dest / member.name).resolve()
+        # is_relative_to is available on Python 3.9+ (project requires >=3.11)
+        if not member_path.is_relative_to(dest_resolved):
+            raise ValueError(f"Unsafe tar entry rejected: {member.name!r}")
+    tar.extractall(dest)
+
+
 def _download_web(version: str) -> bool:
     """Download pre-built web frontend from GitHub releases."""
     import httpx
@@ -214,7 +231,7 @@ def _download_web(version: str) -> bool:
                 item.unlink()
 
         with tarfile.open(tmp_path, "r:gz") as tar:
-            tar.extractall(_WEB_CACHE_DIR)
+            _safe_extract(tar, _WEB_CACHE_DIR)
 
         _MARKER_FILE.write_text(version)
         console.print("[green]Web UI downloaded and cached.[/green]")

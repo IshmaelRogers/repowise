@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import defaultdict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from repowise.core.persistence.database import (
     create_engine,
     create_session_factory,
@@ -50,6 +52,45 @@ from repowise.server.routers import (
 from repowise.server.scheduler import setup_scheduler
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-IP rate limiting (sliding window, in-process)
+# ---------------------------------------------------------------------------
+_RATE_LIMIT_REQUESTS = int(os.environ.get("REPOWISE_RATE_LIMIT_REQUESTS", "300"))
+_RATE_LIMIT_WINDOW = int(os.environ.get("REPOWISE_RATE_LIMIT_WINDOW", "60"))
+
+# Maps client IP → list of request timestamps within the current window
+_rate_limit_hits: dict[str, list[float]] = defaultdict(list)
+
+
+async def _rate_limit_middleware(request: Request, call_next):
+    """Reject requests from IPs that exceed the configured sliding-window limit.
+
+    Defaults to 300 requests per 60 seconds per client IP.  Override with
+    REPOWISE_RATE_LIMIT_REQUESTS and REPOWISE_RATE_LIMIT_WINDOW env vars.
+    Disabled when REPOWISE_RATE_LIMIT_REQUESTS is set to 0.
+    """
+    if _RATE_LIMIT_REQUESTS == 0:
+        return await call_next(request)
+
+    client_ip = request.client.host if request.client else "unknown"
+    now = time.monotonic()
+    cutoff = now - _RATE_LIMIT_WINDOW
+
+    hits = _rate_limit_hits[client_ip]
+    # Prune expired timestamps
+    hits = [t for t in hits if t > cutoff]
+    _rate_limit_hits[client_ip] = hits
+    if len(hits) >= _RATE_LIMIT_REQUESTS:
+        return Response(
+            content='{"detail":"Too many requests"}',
+            status_code=429,
+            media_type="application/json",
+            headers={"Retry-After": str(_RATE_LIMIT_WINDOW)},
+        )
+    hits.append(now)
+    _rate_limit_hits[client_ip] = hits
+    return await call_next(request)
 
 
 def _build_embedder():
@@ -158,11 +199,23 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS — allow all origins for local development
+    # Rate limiting — must be added before CORS so OPTIONS pre-flights also count
+    app.middleware("http")(_rate_limit_middleware)
+
+    # CORS — configurable via REPOWISE_ALLOWED_ORIGINS (comma-separated list).
+    # When using a wildcard origin, credentials cannot be included per the
+    # browser spec, so allow_credentials is only enabled for explicit origins.
+    _allowed_origins_env = os.environ.get("REPOWISE_ALLOWED_ORIGINS", "")
+    _allowed_origins: list[str] = (
+        [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+        if _allowed_origins_env
+        else ["*"]
+    )
+    _allow_credentials = _allowed_origins != ["*"]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=_allowed_origins,
+        allow_credentials=_allow_credentials,
         allow_methods=["*"],
         allow_headers=["*"],
     )
