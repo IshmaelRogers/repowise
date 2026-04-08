@@ -9,6 +9,7 @@ Provides Depends() callables for:
 
 from __future__ import annotations
 
+import hmac
 import os
 from collections.abc import AsyncGenerator
 
@@ -51,5 +52,5 @@ async def verify_api_key(
         return
     if not auth or not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing API key")
-    if auth[7:] != _API_KEY:
+    if not hmac.compare_digest(auth[7:], _API_KEY):
         raise HTTPException(status_code=401, detail="Invalid API key")
